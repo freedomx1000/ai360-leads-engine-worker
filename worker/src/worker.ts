@@ -2,53 +2,67 @@ import { supabase } from "./db";
 import { config } from "./config";
 import { processLeadJob } from "./jobs/processLeadJob";
 
-export async function runWorker() {
-  console.log(`[worker] checking for pending jobs (batch: ${config.batchSize})`);
+function nowIso() {
+  return new Date().toISOString();
+}
 
-  const now = new Date().toISOString();
-  const lockExpiry = new Date(Date.now() - config.lockTtlMs).toISOString();
+function isExpiredLock(lockedAt: string | null, ttlSeconds: number) {
+  if (!lockedAt) return true;
+  const t = new Date(lockedAt).getTime();
+  return Date.now() - t > ttlSeconds * 1000;
+}
 
-  const { data: jobs, error } = await supabase
+export async function runWorker(instanceId: string) {
+  const { data: candidates, error } = await supabase
     .from("leads_jobs")
     .select("*")
-    .eq("status", "pending")
-    .or(`locked_at.is.null,locked_at.lt.${lockExpiry}`)
+    .in("status", ["pending", "processing"])
     .order("created_at", { ascending: true })
-    .limit(config.batchSize);
+    .limit(config.batchSize * 3);
 
-  if (error) {
-    console.error("[worker] fetch error:", error.message);
-    return;
-  }
+  if (error) throw error;
+  if (!candidates || candidates.length === 0) return { processed: 0 };
 
-  if (!jobs || jobs.length === 0) {
-    console.log("[worker] no pending jobs");
-    return;
-  }
+  const toLock = candidates
+    .filter((j: any) => isExpiredLock(j.locked_at ?? null, config.lockTtlSeconds))
+    .slice(0, config.batchSize);
 
-  console.log(`[worker] processing ${jobs.length} jobs`);
+  if (toLock.length === 0) return { processed: 0 };
 
-  for (const job of jobs) {
+  let processed = 0;
+  for (const job of toLock) {
+    const { data: locked, error: lockErr } = await supabase
+      .from("leads_jobs")
+      .update({
+        status: "processing",
+        locked_at: nowIso(),
+        locked_by: instanceId,
+        updated_at: nowIso(),
+      })
+      .eq("id", job.id)
+      .or("locked_at.is.null,locked_at.lt." + new Date(Date.now() - config.lockTtlSeconds * 1000).toISOString())
+      .select("*")
+      .maybeSingle();
+
+    if (lockErr || !locked) continue;
+
     try {
-      await supabase
-        .from("leads_jobs")
-        .update({ locked_at: now })
-        .eq("id", job.id);
-
-      await processLeadJob(job);
-
-      console.log(`[worker] job ${job.id} done`);
+      await processLeadJob(locked);
+      processed++;
     } catch (e: any) {
-      console.error(`[worker] job ${job.id} failed:`, e.message);
+      const msg = (e?.message ?? String(e)).slice(0, 1500);
 
       await supabase
         .from("leads_jobs")
         .update({
           status: "failed",
-          last_error: e.message?.slice(0, 500),
-          locked_at: null,
+          last_error: msg,
+          attempts: (locked.attempts ?? 0) + 1,
+          updated_at: nowIso(),
         })
-        .eq("id", job.id);
+        .eq("id", locked.id);
     }
   }
+
+  return { processed };
 }
