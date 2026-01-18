@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: ai360-leads-worker
+    runtime: node
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: LEADS_BATCH_SIZE
+        value: "5"
+      - key: LEADS_INTERVAL_SECONDS
+        value: "120"
+      - key: LEADS_LOCK_TTL_SECONDS
+        value: "300"
