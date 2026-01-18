@@ -124,7 +124,7 @@ export async function registerRoutes(
           .from('jobs')
           .select('id')
           .eq('payload->lead_id', lead_id)
-          .in('status', ['pending', 'processing'])
+          .in('status', ['queued', 'processing'])
           .limit(1);
 
         if (!existingJobs || existingJobs.length === 0) {
@@ -135,7 +135,7 @@ export async function registerRoutes(
               org_id,
               job_type: 'process_lead',
               payload: { lead_id },
-              status: 'pending',
+              status: 'queued',
               priority: 10,
               attempts: 0,
               max_attempts: 10
