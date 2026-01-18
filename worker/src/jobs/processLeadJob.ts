@@ -4,123 +4,116 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function canonicalize(url: string) {
-  try {
-    const u = new URL(url.trim());
-    u.hash = "";
-    if (u.pathname.endsWith("/")) u.pathname = u.pathname.slice(0, -1);
-    return u.toString();
-  } catch {
-    return url.trim();
-  }
+// Validar UUID v4
+function isValidUuid(str: string): boolean {
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  return uuidRegex.test(str);
 }
 
-function scoreHeuristic(raw: string, sourceType: string) {
-  const text = (raw ?? "").toLowerCase();
-
-  let s = 10;
-  if (sourceType === "linkedin") s += 25;
-  if (sourceType === "marketplace") s += 20;
-  if (sourceType === "forum") s += 12;
-  if (sourceType === "blog") s += 8;
-
-  if (text.includes("busco") || text.includes("looking for")) s += 15;
-  if (text.includes("recomiendan") || text.includes("recommend")) s += 10;
-  if (text.includes("precio") || text.includes("budget")) s += 8;
-  if (text.includes("urgente") || text.includes("asap")) s += 10;
-
-  return Math.max(0, Math.min(100, s));
-}
-
-function interestLevel(score: number) {
-  if (score >= 70) return "hot";
-  if (score >= 40) return "warm";
-  return "cold";
-}
+// Scoring por tipo de evento
+const EVENT_SCORES: Record<string, number> = {
+  post_create: 8,
+  pricing_view: 5,
+  demo_request: 15,
+  thread_view: 3,
+  return_visit: 6,
+  bounce: -2,
+};
 
 export async function processLeadJob(job: any) {
-  const {
-    id: jobId,
-    org_id,
-    source_type,
-    source_url,
-    canonical_url,
-    raw_text,
-    vertical,
-    lead_type,
-    priority,
-  } = job;
+  const jobId = job.id;
+  
+  console.log(`[leads-worker] process_lead start job_id=${jobId}`);
 
-  const canon = canonical_url ?? canonicalize(source_url);
-
-  if (!canonical_url && canon) {
-    await supabase.from("leads_jobs").update({ canonical_url: canon, updated_at: nowIso() }).eq("id", jobId);
+  // A. Extraer lead_id
+  const leadId = job.payload?.lead_id;
+  if (!leadId || typeof leadId !== 'string') {
+    throw new Error('Missing/invalid lead_id');
+  }
+  if (!isValidUuid(leadId)) {
+    throw new Error('Missing/invalid lead_id');
   }
 
-  const score = scoreHeuristic(raw_text ?? "", source_type ?? "other");
-  const level = interestLevel(score);
+  console.log(`[leads-worker] process_lead lead_id=${leadId}`);
 
-  const { data: existing } = await supabase
-    .from("crm_leads")
-    .select("id, score, last_activity_at")
-    .eq("org_id", org_id)
-    .eq("canonical_url", canon)
-    .maybeSingle();
+  // B. Leer lead
+  const { data: lead, error: leadError } = await supabase
+    .from('leads')
+    .select('id, org_id')
+    .eq('id', leadId)
+    .single();
 
-  if (existing?.id) {
-    await supabase
-      .from("crm_leads")
-      .update({
-        score: Math.max(existing.score ?? 0, score),
-        interest_level: level,
-        last_activity_at: nowIso(),
-        source_type: source_type ?? "other",
-        source: source_url,
-        updated_at: nowIso(),
-      })
-      .eq("id", existing.id);
+  if (leadError || !lead) {
+    throw new Error('Lead not found');
+  }
 
-    await supabase.from("leads_jobs").update({ lead_id: existing.id, updated_at: nowIso() }).eq("id", jobId);
+  // C. Leer eventos (últimos 14 días)
+  const fourteenDaysAgo = new Date();
+  fourteenDaysAgo.setDate(fourteenDaysAgo.getDate() - 14);
+
+  const { data: events, error: eventsError } = await supabase
+    .from('events')
+    .select('event_type, created_at')
+    .eq('org_id', lead.org_id)
+    .eq('lead_id', leadId)
+    .gte('created_at', fourteenDaysAgo.toISOString())
+    .limit(500);
+
+  if (eventsError) {
+    throw new Error(`Failed to load events: ${eventsError.message}`);
+  }
+
+  // D. Calcular score
+  let score = 0;
+  let reason = '';
+  const eventCounts: Record<string, number> = {};
+
+  if (!events || events.length === 0) {
+    score = 0;
+    reason = 'no_recent_events';
   } else {
-    const { data: created, error: createErr } = await supabase
-      .from("crm_leads")
-      .insert({
-        org_id,
-        name: null,
-        email: null,
-        phone: null,
-        company: null,
-        stage: "new",
-        score,
-        source: source_url,
-        canonical_url: canon,
-        source_type: source_type ?? "other",
-        notes: raw_text ? raw_text.slice(0, 1500) : null,
-        last_activity_at: nowIso(),
-        created_at: nowIso(),
-        updated_at: nowIso(),
-        lead_type: lead_type ?? "company",
-        vertical: vertical ?? null,
-        problem_summary: raw_text ? raw_text.slice(0, 280) : null,
-        interest_level: level,
-        intent_viewed: false,
-        lead_path_human: null,
-        contact_status: "new",
-      })
-      .select("id")
-      .single();
+    // Contar eventos y calcular score
+    for (const event of events) {
+      const eventType = event.event_type;
+      const points = EVENT_SCORES[eventType] || 0;
+      score += points;
+      eventCounts[eventType] = (eventCounts[eventType] || 0) + 1;
+    }
 
-    if (createErr) throw createErr;
+    // Cap del score (0 a 120)
+    score = Math.max(0, Math.min(120, score));
 
-    await supabase.from("leads_jobs").update({ lead_id: created.id, updated_at: nowIso() }).eq("id", jobId);
+    // Encontrar evento top (más frecuente)
+    let topEvent = 'unknown';
+    let topCount = 0;
+    for (const [eventType, count] of Object.entries(eventCounts)) {
+      if (count > topCount) {
+        topEvent = eventType;
+        topCount = count;
+      }
+    }
+
+    reason = `score=${score} events=${events.length} top=${topEvent}`;
   }
 
-  await supabase
-    .from("leads_jobs")
-    .update({
-      status: "done",
+  console.log(`[leads-worker] process_lead score=${score} events=${events?.length || 0}`);
+
+  // E. Upsert lead_scores
+  const { error: upsertError } = await supabase
+    .from('lead_scores')
+    .upsert({
+      lead_id: leadId,
+      org_id: lead.org_id,
+      score: score,
+      reason: reason,
       updated_at: nowIso(),
-      last_error: null,
-    })
-    .eq("id", jobId);
+    }, {
+      onConflict: 'lead_id',
+    });
+
+  if (upsertError) {
+    throw new Error(`Failed to upsert lead_scores: ${upsertError.message}`);
+  }
+
+  console.log(`[leads-worker] process_lead done job_id=${jobId}`);
 }
