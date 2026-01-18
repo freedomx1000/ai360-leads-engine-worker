@@ -161,5 +161,96 @@ export async function registerRoutes(
     }
   });
 
+    // Identify endpoint
+  app.post("/api/identify", async (req, res) => {
+    try {
+      const { org_id, email, name } = req.body;
+
+      // Validate required fields
+      if (!org_id || !email) {
+        return res.status(400).json({ 
+          ok: false, 
+          error: 'org_id and email are required' 
+        });
+      }
+
+      // Normalize email
+      const normalizedEmail = email.toLowerCase().trim();
+
+      // Search for existing lead
+      const { data: existingLeads } = await supabase
+        .from('leads')
+        .select('id')
+        .eq('org_id', org_id)
+        .eq('email', normalizedEmail)
+        .limit(1);
+
+      let lead_id;
+      let created = false;
+
+      if (!existingLeads || existingLeads.length === 0) {
+        // Create new lead
+        const { data: newLead, error: insertError } = await supabase
+          .from('leads')
+          .insert({
+            org_id,
+            email: normalizedEmail,
+            name: name || null,
+            status: 'known'
+          })
+          .select()
+          .single();
+
+        if (insertError) throw insertError;
+        lead_id = newLead.id;
+        created = true;
+
+        // Reassociate anonymous events
+        await supabase.rpc('reassociate_events', {
+          p_org_id: org_id,
+          p_email: normalizedEmail,
+          p_lead_id: lead_id
+        });
+      } else {
+        lead_id = existingLeads[0].id;
+      }
+
+      // Enqueue process_lead job with dedupe
+      const { data: existingJobs } = await supabase
+        .from('jobs')
+        .select('id')
+        .eq('payload->lead_id', lead_id)
+        .in('status', ['queued', 'processing'])
+        .limit(1);
+
+      if (!existingJobs || existingJobs.length === 0) {
+        await supabase
+          .from('jobs')
+          .insert({
+            org_id,
+            job_type: 'process_lead',
+            payload: { lead_id },
+            status: 'queued',
+            priority: 10,
+            attempts: 0,
+            max_attempts: 10
+          });
+      }
+
+      res.json({
+        ok: true,
+        lead_id,
+        created
+      });
+    } catch (err) {
+      console.error('Identify error:', err);
+      res.status(500).json({ 
+        ok: false, 
+        error: err instanceof Error ? err.message : 'Internal server error' 
+      });
+    }
+  });
+
+
   return httpServer;
 }
