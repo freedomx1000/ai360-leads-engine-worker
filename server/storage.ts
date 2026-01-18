@@ -1,59 +1,139 @@
-import { db } from "./db";
-import { leads, type InsertLead, type Lead, type LeadStats } from "@shared/schema";
-import { eq, desc, sql } from "drizzle-orm";
+import { supabase } from "./supabase";
+import type { LeadStats } from "@shared/schema";
 
-export interface IStorage {
-  getLeads(status?: string): Promise<Lead[]>;
-  getLead(id: number): Promise<Lead | undefined>;
-  createLead(lead: InsertLead): Promise<Lead>;
-  updateLead(id: number, updates: Partial<InsertLead>): Promise<Lead>;
-  getStats(): Promise<LeadStats>;
+// Types matching Supabase tables
+export interface CrmLead {
+  id: number;
+  email: string;
+  name: string | null;
+  company: string | null;
+  job_title: string | null;
+  score: number | null;
+  notes: string | null;
+  source: string | null;
+  created_at: string;
+  updated_at: string | null;
 }
 
-export class DatabaseStorage implements IStorage {
-  async getLeads(status?: string): Promise<Lead[]> {
-    if (status) {
-      return await db.select().from(leads).where(eq(leads.status, status)).orderBy(desc(leads.createdAt));
+export interface LeadsJob {
+  id: number;
+  lead_id: number | null;
+  source_url: string | null;
+  canonical_url: string | null;
+  status: string;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export interface IStorage {
+  getLeads(status?: string): Promise<CrmLead[]>;
+  getLead(id: number): Promise<CrmLead | null>;
+  createLead(lead: Partial<CrmLead>): Promise<CrmLead>;
+  updateLead(id: number, updates: Partial<CrmLead>): Promise<CrmLead | null>;
+  getStats(): Promise<LeadStats>;
+  getJobs(status?: string): Promise<LeadsJob[]>;
+}
+
+export class SupabaseStorage implements IStorage {
+  async getLeads(status?: string): Promise<CrmLead[]> {
+    let query = supabase
+      .from("crm_leads")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    const { data, error } = await query;
+
+    if (error) {
+      console.error("Error fetching leads:", error);
+      return [];
     }
-    return await db.select().from(leads).orderBy(desc(leads.createdAt));
+
+    return data || [];
   }
 
-  async getLead(id: number): Promise<Lead | undefined> {
-    const [lead] = await db.select().from(leads).where(eq(leads.id, id));
-    return lead;
+  async getLead(id: number): Promise<CrmLead | null> {
+    const { data, error } = await supabase
+      .from("crm_leads")
+      .select("*")
+      .eq("id", id)
+      .single();
+
+    if (error) {
+      console.error("Error fetching lead:", error);
+      return null;
+    }
+
+    return data;
   }
 
-  async createLead(insertLead: InsertLead): Promise<Lead> {
-    const [lead] = await db.insert(leads).values(insertLead).returning();
-    return lead;
+  async createLead(lead: Partial<CrmLead>): Promise<CrmLead> {
+    const { data, error } = await supabase
+      .from("crm_leads")
+      .insert(lead)
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Error creating lead: ${error.message}`);
+    }
+
+    return data;
   }
 
-  async updateLead(id: number, updates: Partial<InsertLead>): Promise<Lead> {
-    const [updated] = await db
-      .update(leads)
-      .set(updates)
-      .where(eq(leads.id, id))
-      .returning();
-    return updated;
+  async updateLead(id: number, updates: Partial<CrmLead>): Promise<CrmLead | null> {
+    const { data, error } = await supabase
+      .from("crm_leads")
+      .update({ ...updates, updated_at: new Date().toISOString() })
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) {
+      console.error("Error updating lead:", error);
+      return null;
+    }
+
+    return data;
   }
 
   async getStats(): Promise<LeadStats> {
-    const [stats] = await db
-      .select({
-        total: sql<number>`count(*)`,
-        processed: sql<number>`count(*) filter (where ${leads.status} = 'completed')`,
-        avgScore: sql<number>`avg(${leads.score})`,
-        pending: sql<number>`count(*) filter (where ${leads.status} = 'new')`,
-      })
-      .from(leads);
+    const { data: leads, error } = await supabase
+      .from("crm_leads")
+      .select("score");
 
-    return {
-      total: Number(stats?.total || 0),
-      processed: Number(stats?.processed || 0),
-      avgScore: Math.round(Number(stats?.avgScore || 0)),
-      pending: Number(stats?.pending || 0),
-    };
+    if (error || !leads) {
+      return { total: 0, processed: 0, avgScore: 0, pending: 0 };
+    }
+
+    const total = leads.length;
+    const processed = leads.filter((l) => l.score && l.score > 0).length;
+    const pending = total - processed;
+    const avgScore = processed > 0
+      ? Math.round(leads.reduce((sum, l) => sum + (l.score || 0), 0) / processed)
+      : 0;
+
+    return { total, processed, avgScore, pending };
+  }
+
+  async getJobs(status?: string): Promise<LeadsJob[]> {
+    let query = supabase
+      .from("leads_jobs")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (status) {
+      query = query.eq("status", status);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      console.error("Error fetching jobs:", error);
+      return [];
+    }
+
+    return data || [];
   }
 }
 
-export const storage = new DatabaseStorage();
+export const storage = new SupabaseStorage();

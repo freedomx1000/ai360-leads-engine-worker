@@ -37,3 +37,9 @@ author = "agent"
 task = "shell.exec"
 args = "npm run dev"
 waitForPort = 5000
+
+[userenv]
+
+[userenv.shared]
+LEADS_BATCH_SIZE = "5"
+LEADS_INTERVAL_SECONDS = "300"

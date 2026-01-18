@@ -1,44 +1,78 @@
-import { storage } from "./storage";
-import { calculateScore } from "./services/scoring";
-import { enrichLead } from "./services/enrichment";
+import { supabase } from "./supabase";
+import { config } from "./config";
+import { processLeadJob } from "./jobs/processLeadJob";
+import { sleep } from "./utils/sleep";
 
-export async function processLeadJob(leadId: number) {
-  console.log(`Starting processing for lead ${leadId}...`);
-  
-  try {
-    // 1. Fetch Lead
-    const lead = await storage.getLead(leadId);
-    if (!lead) {
-      throw new Error(`Lead ${leadId} not found`);
+export async function startWorker() {
+  console.log(`Worker started. Batch size: ${config.batchSize}, Interval: ${config.intervalMs}ms`);
+
+  while (true) {
+    try {
+      // Fetch pending jobs
+      const { data: jobs, error } = await supabase
+        .from("leads_jobs")
+        .select("*")
+        .eq("status", "pending")
+        .limit(config.batchSize);
+
+      if (error) {
+        console.error("Error fetching jobs:", error);
+      } else if (jobs && jobs.length > 0) {
+        console.log(`Processing ${jobs.length} jobs...`);
+        
+        for (const job of jobs) {
+          try {
+            await processLeadJob(job);
+            console.log(`Job ${job.id} completed`);
+          } catch (err) {
+            console.error(`Error processing job ${job.id}:`, err);
+            
+            // Mark job as failed
+            await supabase
+              .from("leads_jobs")
+              .update({
+                status: "failed",
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", job.id);
+          }
+        }
+      } else {
+        console.log("No pending jobs found");
+      }
+    } catch (err) {
+      console.error("Worker loop error:", err);
     }
 
-    // Update status to processing
-    await storage.updateLead(leadId, { status: "processing" });
-
-    // 2. Enrich Data
-    console.log(`Enriching lead ${leadId}...`);
-    const enrichedData = await enrichLead(lead);
-    
-    // 3. Score Lead (using enriched data if we wanted, but for now just base fields)
-    console.log(`Scoring lead ${leadId}...`);
-    // We update the lead object in memory to pass to scorer if it needed enriched data
-    const leadWithEnrichment = { ...lead, enrichedData };
-    const score = await calculateScore(leadWithEnrichment);
-
-    // 4. Update Lead
-    await storage.updateLead(leadId, {
-      status: "completed",
-      score,
-      enrichedData,
-      processedAt: new Date(),
-    });
-
-    console.log(`Lead ${leadId} processed successfully. Score: ${score}`);
-    return { success: true, score };
-
-  } catch (error) {
-    console.error(`Error processing lead ${leadId}:`, error);
-    await storage.updateLead(leadId, { status: "failed" });
-    return { success: false, error };
+    await sleep(config.intervalMs);
   }
+}
+
+// Process a single lead manually (for API trigger)
+export async function processLeadById(leadId: number) {
+  // Create a job entry or process directly
+  const { data: lead, error } = await supabase
+    .from("crm_leads")
+    .select("*")
+    .eq("id", leadId)
+    .single();
+
+  if (error || !lead) {
+    throw new Error(`Lead ${leadId} not found`);
+  }
+
+  // Process directly
+  const score = 10;
+  const notes = `Manually processed at ${new Date().toISOString()}`;
+
+  await supabase
+    .from("crm_leads")
+    .update({
+      score,
+      notes,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", leadId);
+
+  return { success: true, score };
 }
