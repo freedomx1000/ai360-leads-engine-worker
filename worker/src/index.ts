@@ -1,25 +1,26 @@
 import { runWorker } from "./worker";
 import { config } from "./config";
 import { sleep } from "./utils/sleep";
-import { randomUUID } from "crypto";
-
-const instanceId = randomUUID();
+import crypto from "crypto";
 
 async function main() {
-  console.log(`[leads-worker] started (instance: ${instanceId})`);
-  console.log(`[leads-worker] batch=${config.batchSize}, interval=${config.intervalSeconds}s, lockTTL=${config.lockTtlSeconds}s`);
+  const instanceId = `leads-${crypto.randomUUID().slice(0, 8)}`;
+  console.log(`[leads-worker] started instance=${instanceId} interval=${config.intervalMs}ms`);
 
   while (true) {
-    try {
-      const result = await runWorker(instanceId);
-      if (result.processed > 0) {
-        console.log(`[leads-worker] processed ${result.processed} jobs`);
-      }
-    } catch (e: any) {
-      console.error("[leads-worker] error:", e.message);
+    const t0 = Date.now();
+    const res = await runWorker(instanceId);
+    const dt = Date.now() - t0;
+
+    if (res.processed > 0) {
+      console.log(`[leads-worker] processed=${res.processed} dt=${dt}ms`);
     }
-    await sleep(config.intervalSeconds * 1000);
+
+    await sleep(config.intervalMs);
   }
 }
 
-main();
+main().catch((e) => {
+  console.error("[leads-worker] fatal", e);
+  process.exit(1);
+});
