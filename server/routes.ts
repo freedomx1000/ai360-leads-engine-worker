@@ -4,6 +4,7 @@ import { storage } from "./storage";
 import { api } from "@shared/routes";
 import { z } from "zod";
 import { processLeadById } from "./worker";
+import { supabase } from "./supabase";
 
 export async function registerRoutes(
   httpServer: Server,
@@ -75,6 +76,89 @@ export async function registerRoutes(
     const status = typeof req.query.status === 'string' ? req.query.status : undefined;
     const jobs = await storage.getJobs(status);
     res.json(jobs);
+  });
+
+
+    // Events Ingest endpoint
+  app.post("/api/events/ingest", async (req, res) => {
+    try {
+      const { org_id, lead_id, event_type, event_data } = req.body;
+
+      // Validate required fields
+      if (!org_id || !event_type) {
+        return res.status(400).json({ 
+          ok: false, 
+          error: 'org_id and event_type are required' 
+        });
+      }
+
+      // Insert event
+      const { data: event, error: eventError } = await supabase
+        .from('events')
+        .insert({
+          org_id,
+          lead_id: lead_id || null,
+          event_type,
+          event_data: event_data || {}
+        })
+        .select()
+        .single();
+
+      if (eventError) throw eventError;
+
+      // Check if event is "strong" and should enqueue a job
+      const strongEvents = [
+        'post_create',
+        'pricing_view',
+        'demo_request',
+        'return_visit',
+        'lead.created',
+        'lead.enriched'
+      ];
+
+      let job_enqueued = false;
+
+      if (strongEvents.includes(event_type) && lead_id) {
+        // Check for existing job (dedupe)
+        const { data: existingJobs } = await supabase
+          .from('jobs')
+          .select('id')
+          .eq('payload->lead_id', lead_id)
+          .in('status', ['pending', 'processing'])
+          .limit(1);
+
+        if (!existingJobs || existingJobs.length === 0) {
+          // Enqueue job
+          const { error: jobError } = await supabase
+            .from('jobs')
+            .insert({
+              org_id,
+              job_type: 'process_lead',
+              payload: { lead_id },
+              status: 'pending',
+              priority: 10,
+              attempts: 0,
+              max_attempts: 10
+            });
+
+          if (!jobError) {
+            job_enqueued = true;
+          }
+        }
+      }
+
+      res.json({
+        ok: true,
+        event_id: event.id,
+        job_enqueued
+      });
+    } catch (err) {
+      console.error('Events ingest error:', err);
+      res.status(500).json({ 
+        ok: false, 
+        error: err instanceof Error ? err.message : 'Internal server error' 
+      });
+    }
   });
 
   return httpServer;
