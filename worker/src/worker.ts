@@ -2,65 +2,54 @@ import { supabase } from "./db";
 import { config } from "./config";
 import { processLeadJob } from "./jobs/processLeadJob";
 
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function isExpiredLock(lockedAt: string | null, ttlSeconds: number) {
-  if (!lockedAt) return true;
-  const t = new Date(lockedAt).getTime();
-  return Date.now() - t > ttlSeconds * 1000;
-}
-
 export async function runWorker(instanceId: string) {
-  const { data: candidates, error } = await supabase
-    .from("leads_jobs")
-    .select("*")
-    .in("status", ["pending", "processing"])
-    .order("created_at", { ascending: true })
-    .limit(config.batchSize * 3);
+  // Call RPC function to claim jobs
+  const { data: jobs, error } = await supabase
+    .rpc('claim_next_job', {
+      p_worker: config.workerId,
+      p_types: ['process_lead'],
+      p_limit: config.batchSize
+    });
 
-  if (error) throw error;
-  if (!candidates || candidates.length === 0) return { processed: 0 };
+  if (error) {
+    console.error('[leads-worker] claim error:', error);
+    return { processed: 0 };
+  }
 
-  const toLock = candidates
-    .filter((j: any) => isExpiredLock(j.locked_at ?? null, config.lockTtlSeconds))
-    .slice(0, config.batchSize);
+  if (!jobs || jobs.length === 0) {
+    console.log(`[leads-worker] claimed 0 jobs`);
+    return { processed: 0 };
+  }
 
-  if (toLock.length === 0) return { processed: 0 };
-
+  console.log(`[leads-worker] claimed ${jobs.length} jobs`);
   let processed = 0;
-  for (const job of toLock) {
-    const { data: locked, error: lockErr } = await supabase
-      .from("leads_jobs")
-      .update({
-        status: "processing",
-        locked_at: nowIso(),
-        locked_by: instanceId,
-        updated_at: nowIso(),
-      })
-      .eq("id", job.id)
-      .or("locked_at.is.null,locked_at.lt." + new Date(Date.now() - config.lockTtlSeconds * 1000).toISOString())
-      .select("*")
-      .maybeSingle();
 
-    if (lockErr || !locked) continue;
-
+  for (const job of jobs) {
     try {
-      await processLeadJob(locked);
-      processed++;
+      await processLeadJob(job);
+      
+      // Mark job as done
+      const { error: doneErr } = await supabase
+        .rpc('mark_job_done', { p_job_id: job.id });
+        
+      if (doneErr) {
+        console.error(`[leads-worker] mark_job_done error:`, doneErr);
+      } else {
+        processed++;
+      }
     } catch (e: any) {
       const msg = (e?.message ?? String(e)).slice(0, 1500);
-
-      await supabase
-        .from("leads_jobs")
-        .update({
-          status: "failed",
-          last_error: msg,
-          attempts: (locked.attempts ?? 0) + 1,
-          updated_at: nowIso(),
-        })
-        .eq("id", locked.id);
+      
+      // Mark job as failed
+      const { error: failErr } = await supabase
+        .rpc('mark_job_failed', {
+          p_job_id: job.id,
+          p_error: msg
+        });
+        
+      if (failErr) {
+        console.error(`[leads-worker] mark_job_failed error:`, failErr);
+      }
     }
   }
 
