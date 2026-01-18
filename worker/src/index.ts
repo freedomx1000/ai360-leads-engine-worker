@@ -5,7 +5,7 @@ import crypto from "crypto";
 
 async function main() {
   const instanceId = `leads-${crypto.randomUUID().slice(0, 8)}`;
-  console.log(`[leads-worker] started instance=${instanceId} interval=${config.intervalMs}ms`);
+    console.log(`[leads-worker] started worker=${config.workerId} poll_ms=${config.intervalMs} batch_size=${config.batchSize}`);
 
   while (true) {
     const t0 = Date.now();
