@@ -1,9 +1,9 @@
 services:
   - type: worker
-    name: ai360-leads-worker
-    runtime: node
-    buildCommand: npm install && npm run build
-    startCommand: npm start
+    name: ai360-leads-engine-worker
+    env: docker
+    dockerfilePath: worker/Dockerfile
+    dockerContext: worker
     envVars:
       - key: SUPABASE_URL
         sync: false
